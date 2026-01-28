@@ -1,6 +1,6 @@
 # name: digest-fulltracking
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional link-parameter appending + debug logs
-# version: 2.1
+# version: 2.2
 # authors: you
 
 after_initialize do
@@ -31,7 +31,7 @@ after_initialize do
     OPEN_TRACKING_ENABLED = true
     OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
 
-    # Link appending (DO IT LIKE THE WORKING PLUGIN)
+    # Link appending
     APPEND_LINK_DATA_ENABLED = true
     SKIP_UNSUB_AND_PREF_LINKS = true
 
@@ -148,7 +148,6 @@ after_initialize do
       false
     end
 
-    # Generate a random 20-digit numeric string.
     def self.random_20_digit_id
       digits = +""
       20.times { digits << SecureRandom.random_number(10).to_s }
@@ -158,7 +157,7 @@ after_initialize do
       (t + "0" * 20)[0, 20]
     end
 
-    # Ensure the message has an email_id header (generate once)
+    # Ensure message has X-Digest-Report-Email-Id
     def self.ensure_email_id!(message)
       eid = header_val(message, "X-Digest-Report-Email-Id")
       return eid unless eid.empty?
@@ -168,6 +167,25 @@ after_initialize do
       eid
     rescue StandardError
       random_20_digit_id
+    end
+
+    # If before_email_send receives a different message object,
+    # reuse the email_id that was already appended into links.
+    def self.extract_email_id_from_body(message)
+      body = extract_email_body(message)
+      return "" if body.to_s.empty?
+
+      begin
+        body = CGI.unescapeHTML(body.to_s)
+      rescue StandardError
+        body = body.to_s
+      end
+
+      # Matches: email_id=123.. OR email_id%3D123.. (encoded)
+      m = body.match(/(?:email_id=|email_id%3D)(\d{20})/i)
+      m ? m[1].to_s : ""
+    rescue StandardError
+      ""
     end
 
     def self.store_last_email_id_for_user(user_id, email_id)
@@ -187,7 +205,7 @@ after_initialize do
       ""
     end
 
-    # ====== The EXACT link rewrite style from the working plugin (digest-append-data) ======
+    # ===== link rewrite (same as the working plugin style) =====
     def self.rewrite_digest_links_like_working_plugin!(message, user, email_id)
       return if message.nil?
       return unless append_link_data_enabled?
@@ -207,10 +225,8 @@ after_initialize do
 
       dayofweek_val = encoded_email_b64url(user&.email)
 
-      # Prefer Nokogiri if available (same as your working plugin)
       if Nokogiri
         doc = Nokogiri::HTML(body)
-
         changed = 0
 
         doc.css("a[href]").each do |a|
@@ -253,10 +269,11 @@ after_initialize do
         html_part.body = doc.to_html
         dlog("append-links: nokogiri changed=#{changed} user_id=#{user.id} email_id=#{email_id}")
       else
-        # Fallback regex path (same spirit as your old plugin)
         html_part.body = body.gsub(/href="(#{Regexp.escape(base)}[^"]*|\/[^"]*)"/) do
           url = Regexp.last_match(1)
-          next %{href="#{url}"} if (SKIP_UNSUB_AND_PREF_LINKS && (url.include?("/email/unsubscribe") || url.include?("/my/preferences")))
+          if SKIP_UNSUB_AND_PREF_LINKS
+            next %{href="#{url}"} if url.include?("/email/unsubscribe") || url.include?("/my/preferences")
+          end
 
           joiner = url.include?("?") ? "&" : "?"
           extra = "isdigest=1&u=#{user.id}"
@@ -272,7 +289,7 @@ after_initialize do
       dlog_error("append-links error err=#{e.class}: #{e.message}")
     end
 
-    # ===== Pixel helpers =====
+    # ===== pixel helpers =====
     def self.extract_email_body(message)
       return "" if message.nil?
       if message.respond_to?(:multipart?) && message.multipart?
@@ -353,7 +370,7 @@ after_initialize do
       false
     end
 
-    # ===== After-send topic extraction (unchanged) =====
+    # ===== topic extraction for postback =====
     def self.extract_topic_ids_from_message(message)
       body = extract_email_body(message)
       return [] if body.to_s.empty?
@@ -392,9 +409,7 @@ after_initialize do
   end
 
   # ==========================================================
-  # 1) DO LINK APPEND THE SAME WAY AS THE WORKING PLUGIN:
-  #    prepend UserNotifications#digest and rewrite links there.
-  #    ALSO: generate/stamp email_id there so it matches pixel later.
+  # 1) Digest creation hook (WORKING WAY): append links here + stamp email_id header here
   # ==========================================================
   module ::DigestReportDigestHook
     def digest(user, opts = {})
@@ -403,7 +418,6 @@ after_initialize do
           next unless ::DigestReport.enabled?
           next if message.nil?
 
-          # Ensure email_id exists early (this is the "shared id" for links + pixel)
           email_id = ::DigestReport.ensure_email_id!(message)
 
           if user && user.id.to_i > 0
@@ -414,7 +428,7 @@ after_initialize do
             ::DigestReport.rewrite_digest_links_like_working_plugin!(message, user, email_id)
           end
 
-          ::DigestReport.dlog("digest(): prepared email_id=#{email_id} user_id=#{user&.id} append_links=#{::DigestReport.append_link_data_enabled?}")
+          ::DigestReport.dlog("digest(): email_id=#{email_id} user_id=#{user&.id} append_links=#{::DigestReport.append_link_data_enabled?}")
         rescue StandardError => e
           ::DigestReport.dlog_error("digest() hook error err=#{e.class}: #{e.message}")
         end
@@ -427,17 +441,29 @@ after_initialize do
   end
 
   # ==========================================================
-  # 2) BEFORE send: only handle PIXEL injection + headers,
-  #    reusing the SAME email_id stamped in digest().
+  # 2) BEFORE send: pixel injection + ensure SAME email_id as links
+  #    If header missing (different message instance), extract from body.
   # ==========================================================
   DiscourseEvent.on(:before_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
+      next if message.nil?
 
-      email_id = ::DigestReport.ensure_email_id!(message)
+      email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
 
-      # prevent double pixel logic
+      if email_id.to_s.strip.empty?
+        email_id = ::DigestReport.extract_email_id_from_body(message)
+        ::DigestReport.dlog("before_email_send: header missing; extracted email_id=#{email_id.inspect}")
+      end
+
+      if email_id.to_s.strip.empty?
+        email_id = ::DigestReport.random_20_digit_id
+        ::DigestReport.dlog("before_email_send: could not extract; generated email_id=#{email_id}")
+      end
+
+      ::DigestReport.set_header!(message, "X-Digest-Report-Email-Id", email_id)
+
       already_set = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
       if !already_set.empty?
         ::DigestReport.dlog("before_email_send: open-tracking header already set -> skip pixel (email_id=#{email_id})")
@@ -445,7 +471,7 @@ after_initialize do
       end
 
       recipient = Array(message&.to).first.to_s.strip rescue ""
-      user = (recipient.empty? ? nil : User.find_by_email(recipient) rescue nil)
+      user = (recipient.empty? ? nil : (User.find_by_email(recipient) rescue nil))
       uid = user ? user.id : 0
 
       injected = false
@@ -469,7 +495,7 @@ after_initialize do
   end
 
   # ==========================================================
-  # Job: postback (same as before, reads email_id from header via after hook)
+  # Job: postback
   # ==========================================================
   class ::Jobs::DigestReportPostback < ::Jobs::Base
     sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
@@ -578,13 +604,13 @@ after_initialize do
     begin
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
+      next if message.nil?
 
       recipient = Array(message&.to).first.to_s.strip rescue ""
-
-      subject = ::DigestReport.safe_str(message&.subject, ::DigestReport::SUBJECT_MAX_LEN) rescue ""
+      subject = (::DigestReport.safe_str(message&.subject, ::DigestReport::SUBJECT_MAX_LEN) rescue "")
       from_email = (Array(message&.from).first.to_s.strip rescue "")
 
-      user = (recipient.empty? ? nil : User.find_by_email(recipient) rescue nil)
+      user = (recipient.empty? ? nil : (User.find_by_email(recipient) rescue nil))
       user_id = user ? user.id : ""
       username = user ? user.username.to_s : ""
       user_created_at_utc = user ? ::DigestReport.safe_iso8601(user.created_at) : ""
@@ -592,7 +618,11 @@ after_initialize do
       topic_ids = ::DigestReport.extract_topic_ids_from_message(message)
 
       email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
-      email_id = ::DigestReport.random_20_digit_id if email_id.to_s.strip.empty?
+      if email_id.to_s.strip.empty?
+        # If even here it's missing, try body extraction, else generate
+        email_id = ::DigestReport.extract_email_id_from_body(message)
+        email_id = ::DigestReport.random_20_digit_id if email_id.to_s.strip.empty?
+      end
 
       open_tracking_used = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
       open_tracking_used = (open_tracking_used == "1" ? "1" : "0")
