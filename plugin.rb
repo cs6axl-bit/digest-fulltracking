@@ -1,4 +1,4 @@
-# name: digest-report
+# name: digest-fulltracking
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional link-parameter appending + debug logs
 # version: 2.0
 # authors: you
@@ -18,7 +18,7 @@ after_initialize do
   end
 
   module ::DigestReport
-    PLUGIN_NAME = "digest-report"
+    PLUGIN_NAME = "digest-fulltracking"
 
     # =========================
     # HARD-CODED SETTINGS (edit here)
